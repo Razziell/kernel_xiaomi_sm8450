@@ -2249,8 +2249,8 @@ static long process_accept_req(struct file *filp, unsigned int cmd,
 		 * new cb requests.
 		 */
 		if (!cb_txn) {
-			pr_err("%s txn %d either invalid or removed from Q\n",
-					__func__, user_args.txn_id);
+			pr_debug_ratelimited("%s txn %d either invalid or removed from Q\n",
+					     __func__, user_args.txn_id);
 			goto start_waiting_for_requests;
 		}
 		ret = marshal_out_tzcb_req(&user_args, cb_txn,
@@ -2294,8 +2294,8 @@ start_waiting_for_requests:
 			mutex_lock(&g_smcinvoke_lock);
 
 			if (freezing(current)) {
-				pr_err("Server id :%d interrupted probaby due to suspend, pid:%d\n",
-					server_info->server_id, current->pid);
+				pr_debug("Server id :%d interrupted probably due to suspend, pid:%d\n",
+					 server_info->server_id, current->pid);
 				/*
 				 * Each accept thread is identified by bits ranging from
 				 * 0 to DEFAULT_CBOBJ_THREAD_CNT-1. When an accept thread is
@@ -2308,9 +2308,9 @@ start_waiting_for_requests:
 						SET_BIT(server_info->is_server_suspended,
 							(current->pid)%DEFAULT_CB_OBJ_THREAD_CNT);
 			} else {
-				pr_err("Setting pid:%d, server id : %d state to defunct\n",
-						current->pid, server_info->server_id);
-						server_info->state = SMCINVOKE_SERVER_STATE_DEFUNCT;
+				pr_warn_ratelimited("Setting pid:%d, server id : %d state to defunct\n",
+						    current->pid, server_info->server_id);
+				server_info->state = SMCINVOKE_SERVER_STATE_DEFUNCT;
 			}
 
 			mutex_unlock(&g_smcinvoke_lock);
