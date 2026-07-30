@@ -24,6 +24,17 @@ config MQ_IOSCHED_KYBER
 	  synchronous writes, it will self-tune queue depths to achieve that
 	  goal.
 
+config DEFAULT_KYBER
+	bool "Use Kyber as the default I/O scheduler"
+	depends on MQ_IOSCHED_KYBER=y
+	default n
+	help
+	  Select Kyber by default for eligible single-queue blk-mq devices.
+	  This is intended for fast storage devices such as mobile UFS, where
+	  Kyber can regulate queue depth according to read and write latency.
+	  Devices that disable scheduling by default remain unaffected. If
+	  Kyber cannot be selected, the block layer falls back to mq-deadline.
+
 config IOSCHED_BFQ
 	tristate "BFQ I/O scheduler"
 	help

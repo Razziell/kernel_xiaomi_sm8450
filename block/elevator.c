@@ -617,16 +617,24 @@ static inline bool elv_support_iosched(struct request_queue *q)
 }
 
 /*
- * For single queue devices, default to using mq-deadline. If we have multiple
- * queues or mq-deadline is not available, default to "none".
+ * For single queue devices, use the configured default scheduler. If it is
+ * unavailable, fall back to mq-deadline and then to "none".
  */
 static struct elevator_type *elevator_get_default(struct request_queue *q)
 {
+	struct elevator_type *e;
+
 	if (q->tag_set && q->tag_set->flags & BLK_MQ_F_NO_SCHED_BY_DEFAULT)
 		return NULL;
 
 	if (q->nr_hw_queues != 1)
 		return NULL;
+
+	if (IS_ENABLED(CONFIG_DEFAULT_KYBER)) {
+		e = elevator_get(q, "kyber", false);
+		if (e)
+			return e;
+	}
 
 	return elevator_get(q, "mq-deadline", false);
 }
