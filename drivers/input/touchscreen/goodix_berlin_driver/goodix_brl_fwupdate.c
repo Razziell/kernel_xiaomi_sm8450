@@ -949,7 +949,11 @@ int goodix_fw_update_proc(struct fw_update_ctrl *fwu_ctrl)
 
 	if (!(fwu_ctrl->mode & UPDATE_MODE_FORCE)) {
 		ret = goodix_fw_version_compare(fwu_ctrl);
-		ts_info("need to upgrade");
+		if (ret == COMPARE_EQUAL) {
+			ts_info("firmware and config are up to date");
+			return 0;
+		}
+		ts_info("need to upgrade, compare result:%d", ret);
 	}
 
 start_update:

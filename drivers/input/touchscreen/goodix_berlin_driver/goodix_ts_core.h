@@ -24,6 +24,7 @@
 #include <asm/unaligned.h>
 #include <linux/vmalloc.h>
 #include <linux/kthread.h>
+#include <linux/completion.h>
 #include <linux/delay.h>
 #include <linux/mutex.h>
 #include <linux/platform_device.h>
@@ -519,6 +520,9 @@ struct goodix_ts_core {
 
 	atomic_t irq_enabled;
 	atomic_t suspended;
+	/* Serialize wake-depth changes from the power and gesture workqueues. */
+	struct mutex irq_wake_lock;
+	bool irq_wake_enabled;
 	/* when this flag is true, driver should not clean the sync flag */
 	bool tools_ctrl_sync;
 
@@ -549,6 +553,9 @@ struct goodix_ts_core {
 	atomic_t trusted_touch_mode;
 #endif
 
+	/* Signalled when the asynchronous stage 2 init thread finishes. */
+	struct completion init_done;
+	bool init_thread_started;
 	struct workqueue_struct *power_wq;
 	struct work_struct resume_work;
 	struct work_struct suspend_work;
@@ -696,6 +703,7 @@ struct kobject *goodix_get_default_kobj(void);
 
 struct goodix_ts_hw_ops *goodix_get_hw_ops(void);
 int goodix_get_config_proc(struct goodix_ts_core *cd);
+int goodix_ts_set_irq_wake(struct goodix_ts_core *cd, bool enable);
 
 int goodix_spi_bus_init(void);
 void goodix_spi_bus_exit(void);

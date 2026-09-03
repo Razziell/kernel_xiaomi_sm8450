@@ -19,6 +19,7 @@
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/uaccess.h>
+#include <linux/gpio/consumer.h>
 #include <linux/soc/qcom/panel_event_notifier.h>
 
 #if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 38)
@@ -1035,16 +1036,101 @@ static int goodix_parse_dt_resolution(struct device_node *node,
 }
 
 /**
+ * goodix_parse_panel_firmware - select panel-specific firmware from dt
+ * @node: pointer to device tree node
+ * @board_data: pointer to board data structure
+ * return: 0 - firmware selected, <0 - use the generic properties
+ */
+static int goodix_parse_panel_firmware(struct device_node *node,
+				       struct goodix_ts_board_data *board_data)
+{
+	struct gpio_desc *id_gpio_a, *id_gpio_b;
+	const char *fw_property, *cfg_property;
+	const char *fw_name, *cfg_name;
+	int gpio_a, gpio_b, panel_type;
+	int ret;
+
+	if (!of_find_property(node, "goodix,panel-id-gpio-a", NULL) ||
+	    !of_find_property(node, "goodix,panel-id-gpio-b", NULL))
+		return -ENOENT;
+
+	id_gpio_a = gpiod_get_from_of_node(node,
+					   "goodix,panel-id-gpio-a", 0,
+					   GPIOD_IN, "goodix_panel_id_a");
+	if (IS_ERR(id_gpio_a))
+		return PTR_ERR(id_gpio_a);
+
+	id_gpio_b = gpiod_get_from_of_node(node,
+					   "goodix,panel-id-gpio-b", 0,
+					   GPIOD_IN, "goodix_panel_id_b");
+	if (IS_ERR(id_gpio_b)) {
+		ret = PTR_ERR(id_gpio_b);
+		goto put_gpio_a;
+	}
+
+	/* The original Xiaomi driver identifies the panel from raw strap levels. */
+	gpio_a = gpiod_get_raw_value_cansleep(id_gpio_a);
+	if (gpio_a < 0) {
+		ret = gpio_a;
+		goto put_gpios;
+	}
+
+	gpio_b = gpiod_get_raw_value_cansleep(id_gpio_b);
+	if (gpio_b < 0) {
+		ret = gpio_b;
+		goto put_gpios;
+	}
+
+	panel_type = gpio_a << 1 | gpio_b;
+	switch (panel_type) {
+	case 1:
+		fw_property = "goodix,firmware-namea";
+		cfg_property = "goodix,config-namea";
+		break;
+	case 2:
+		fw_property = "goodix,firmware-nameb";
+		cfg_property = "goodix,config-nameb";
+		break;
+	default:
+		ts_err("invalid panel id gpio values: a=%d, b=%d",
+		       gpio_a, gpio_b);
+		ret = -ENODEV;
+		goto put_gpios;
+	}
+
+	ret = of_property_read_string(node, fw_property, &fw_name);
+	if (ret)
+		goto put_gpios;
+
+	ret = of_property_read_string(node, cfg_property, &cfg_name);
+	if (ret)
+		goto put_gpios;
+
+	strscpy(board_data->fw_name, fw_name, sizeof(board_data->fw_name));
+	strscpy(board_data->cfg_bin_name, cfg_name,
+		sizeof(board_data->cfg_bin_name));
+	ts_info("panel type %d (gpio a=%d, b=%d), firmware=%s, config=%s",
+		panel_type, gpio_a, gpio_b, fw_name, cfg_name);
+	ret = 0;
+
+put_gpios:
+	gpiod_put(id_gpio_b);
+put_gpio_a:
+	gpiod_put(id_gpio_a);
+	return ret;
+}
+
+/**
  * goodix_parse_dt - parse board data from dt
- * @dev: pointer to device
+ * @node: pointer to device tree node
  * @board_data: pointer to board data structure
  * return: 0 - no error, <0 error
  */
 static int goodix_parse_dt(struct device_node *node,
-	struct goodix_ts_board_data *board_data)
+			   struct goodix_ts_board_data *board_data)
 {
 	const char *name_tmp;
-	int r;
+	int r, panel_fw_ret;
 
 	if (!board_data) {
 		ts_err("invalid board data");
@@ -1118,32 +1204,42 @@ static int goodix_parse_dt(struct device_node *node,
 				sizeof(board_data->iovdd_name));
 	}
 
-	/* get firmware file name */
-	r = of_property_read_string(node, "goodix,firmware-name", &name_tmp);
-	if (!r) {
-		ts_info("firmware name from dt: %s", name_tmp);
-		strlcpy(board_data->fw_name,
-				name_tmp, sizeof(board_data->fw_name));
-	} else {
-		ts_info("can't find firmware name, use default: %s",
-				TS_DEFAULT_FIRMWARE);
-		strlcpy(board_data->fw_name,
-				TS_DEFAULT_FIRMWARE,
-				sizeof(board_data->fw_name));
-	}
+	panel_fw_ret = goodix_parse_panel_firmware(node, board_data);
+	if (panel_fw_ret == -EPROBE_DEFER)
+		return panel_fw_ret;
 
-	/* get config file name */
-	r = of_property_read_string(node, "goodix,config-name", &name_tmp);
-	if (!r) {
-		ts_info("config name from dt: %s", name_tmp);
-		strlcpy(board_data->cfg_bin_name, name_tmp,
+	if (panel_fw_ret) {
+		if (panel_fw_ret != -ENOENT)
+			ts_info("panel-specific firmware selection failed: %d",
+				panel_fw_ret);
+
+		/* get firmware file name */
+		r = of_property_read_string(node, "goodix,firmware-name",
+					    &name_tmp);
+		if (!r) {
+			ts_info("firmware name from dt: %s", name_tmp);
+			strscpy(board_data->fw_name, name_tmp,
+				sizeof(board_data->fw_name));
+		} else {
+			ts_info("can't find firmware name, use default: %s",
+				TS_DEFAULT_FIRMWARE);
+			strscpy(board_data->fw_name, TS_DEFAULT_FIRMWARE,
+				sizeof(board_data->fw_name));
+		}
+
+		/* get config file name */
+		r = of_property_read_string(node, "goodix,config-name",
+					    &name_tmp);
+		if (!r) {
+			ts_info("config name from dt: %s", name_tmp);
+			strscpy(board_data->cfg_bin_name, name_tmp,
 				sizeof(board_data->cfg_bin_name));
-	} else {
-		ts_info("can't find config name, use default: %s",
+		} else {
+			ts_info("can't find config name, use default: %s",
 				TS_DEFAULT_CFG_BIN);
-		strlcpy(board_data->cfg_bin_name,
-				TS_DEFAULT_CFG_BIN,
+			strscpy(board_data->cfg_bin_name, TS_DEFAULT_CFG_BIN,
 				sizeof(board_data->cfg_bin_name));
+		}
 	}
 
 	/* get xyz resolutions */
@@ -1790,6 +1886,30 @@ static void goodix_ts_release_connects(struct goodix_ts_core *core_data)
 	mutex_unlock(&input_dev->mutex);
 }
 
+int goodix_ts_set_irq_wake(struct goodix_ts_core *cd, bool enable)
+{
+	int ret = 0;
+
+	mutex_lock(&cd->irq_wake_lock);
+	if (cd->irq_wake_enabled == enable)
+		goto out;
+
+	ret = enable ? enable_irq_wake(cd->irq) : disable_irq_wake(cd->irq);
+	if (ret) {
+		ts_err("failed to %s IRQ %d wake: %d",
+		       enable ? "enable" : "disable", cd->irq, ret);
+		goto out;
+	}
+
+	cd->irq_wake_enabled = enable;
+	ts_debug("IRQ %d wake %s", cd->irq,
+		 enable ? "enabled" : "disabled");
+
+out:
+	mutex_unlock(&cd->irq_wake_lock);
+	return ret;
+}
+
 /**
  * goodix_ts_suspend - Touchscreen suspend function
  * Called by PM/FB/EARLYSUSPEN module to put the device to  sleep
@@ -1972,6 +2092,7 @@ static void goodix_set_gesture_work(struct work_struct *work)
 
 	if (target_gesture_type == 0) {
 		hw_ops->irq_enable(core_data, false);
+		goodix_ts_set_irq_wake(core_data, false);
 		hw_ops->gesture(core_data, 0);
 		goto exit;
 	}
@@ -1990,6 +2111,7 @@ static void goodix_set_gesture_work(struct work_struct *work)
 		ts_err("enter gesture mode");
 	}
 	hw_ops->irq_enable(core_data, true);
+	goodix_ts_set_irq_wake(core_data, true);
 
 exit:
 	pm_relax(core_data->bus->dev);
@@ -2303,11 +2425,10 @@ static int goodix_send_ic_config(struct goodix_ts_core *cd, int type)
  * This function respond for get fw version and try upgrade fw and config.
  * Note: when init encounter error, need release all resource allocated here.
  */
-static int goodix_later_init_thread(void *data)
+static int goodix_later_init(struct goodix_ts_core *cd)
 {
 	int ret, i;
 	int update_flag = UPDATE_MODE_BLOCK | UPDATE_MODE_SRC_REQUEST;
-	struct goodix_ts_core *cd = data;
 	struct goodix_ts_hw_ops *hw_ops = cd->hw_ops;
 
 	/* step 1: read version */
@@ -2386,9 +2507,24 @@ err_out:
 	return ret;
 }
 
+static int goodix_later_init_thread(void *data)
+{
+	struct goodix_ts_core *cd = data;
+	int ret;
+
+	ret = goodix_later_init(cd);
+	/* The thread exits on its own, so remove() waits on this instead of
+	 * calling kthread_stop() on a possibly freed task_struct.
+	 */
+	complete(&cd->init_done);
+	return ret;
+}
+
 static int goodix_start_later_init(struct goodix_ts_core *ts_core)
 {
 	struct task_struct *init_thrd;
+
+	init_completion(&ts_core->init_done);
 	/* create and run update thread */
 	init_thrd = kthread_run(goodix_later_init_thread,
 				ts_core, "goodix_init_thread");
@@ -2397,6 +2533,7 @@ static int goodix_start_later_init(struct goodix_ts_core *ts_core)
 			PTR_ERR(init_thrd));
 		return -EFAULT;
 	}
+	ts_core->init_thread_started = true;
 	return 0;
 }
 
@@ -2524,13 +2661,14 @@ static int goodix_ts_probe(struct platform_device *pdev)
 		core_module_prob_sate = CORE_MODULE_PROB_FAILED;
 		return -ENOMEM;
 	}
+	mutex_init(&core_data->irq_wake_lock);
 
 	if (IS_ENABLED(CONFIG_OF) && bus_interface->dev->of_node) {
 		/* parse devicetree property */
 		ret = goodix_parse_dt(node, &core_data->board_data);
 		if (ret) {
 			ts_err("failed parse device info form dts, %d", ret);
-			return -EINVAL;
+			return ret;
 		}
 #if defined(CONFIG_DRM)
 		of_property_read_string(node, "qcom,touch-environment",
@@ -2604,6 +2742,10 @@ static int goodix_ts_remove(struct platform_device *pdev)
 	struct goodix_ts_hw_ops *hw_ops = core_data->hw_ops;
 	struct goodix_ts_esd *ts_esd = &core_data->ts_esd;
 
+	/* Wait for the asynchronous stage 2 init before tearing down. */
+	if (core_data->init_thread_started)
+		wait_for_completion(&core_data->init_done);
+
 	xiaomi_touch_deinit(core_data);
 	goodix_ts_unregister_notifier(&core_data->ts_notifier);
 	goodix_tools_exit();
@@ -2614,6 +2756,7 @@ static int goodix_ts_remove(struct platform_device *pdev)
 	#endif
 		inspect_module_exit();
 		hw_ops->irq_enable(core_data, false);
+		goodix_ts_set_irq_wake(core_data, false);
 
 	#if defined(CONFIG_DRM)
 		if (core_data->notifier_cookie)
@@ -2631,8 +2774,10 @@ static int goodix_ts_remove(struct platform_device *pdev)
 		goodix_ts_pen_dev_remove(core_data);
 		goodix_ts_sysfs_exit(core_data);
 		goodix_ts_procfs_exit(core_data);
-		goodix_ts_power_off(core_data);
 	}
+
+	/* Power is enabled during stage 1, before the asynchronous init. */
+	goodix_ts_power_off(core_data);
 
 	return 0;
 }
