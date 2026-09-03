@@ -4,6 +4,7 @@
  */
 
 #include <linux/debugfs.h>
+#include <linux/delay.h>
 #include <linux/err.h>
 #include <linux/i2c.h>
 #include <linux/gpio/consumer.h>
@@ -117,6 +118,31 @@ static int eusb2_i2c_read_reg(struct eusb2_repeater *er, u8 reg, u8 *val)
 	return 0;
 }
 
+/*
+ * The repeater is accessed right after its supplies are enabled and reset is
+ * released, but it needs a couple of milliseconds before it ACKs on I2C. Poll
+ * the revision register instead of failing on the first NACK.
+ */
+#define EUSB2_REPEATER_READY_RETRIES	5
+
+static int eusb2_repeater_wait_ready(struct eusb2_repeater *er, u8 reg, u8 *val)
+{
+	int i, ret;
+
+	for (i = 0; i < EUSB2_REPEATER_READY_RETRIES; i++) {
+		ret = eusb2_i2c_read_reg(er, reg, val);
+		if (!ret) {
+			if (i)
+				dev_dbg(er->dev, "ready after %d retries\n", i);
+			return 0;
+		}
+		usleep_range(1000, 1500);
+	}
+
+	dev_err(er->dev, "not responding on I2C after %d retries\n", i);
+	return ret;
+}
+
 static int eusb2_i2c_write_reg(struct eusb2_repeater *er, u8 reg, u32 val)
 {
 	int ret;
@@ -132,15 +158,19 @@ static int eusb2_i2c_write_reg(struct eusb2_repeater *er, u8 reg, u32 val)
 	return 0;
 }
 
-static void eusb2_repeater_update_seq(struct eusb2_repeater *er, u32 *seq, u8 cnt)
+static int eusb2_repeater_update_seq(struct eusb2_repeater *er, u32 *seq, u8 cnt)
 {
-	int i;
+	int i, ret;
 
 	dev_dbg(er->ur.dev, "param override seq count:%d\n", cnt);
 	for (i = 0; i < cnt; i = i+2) {
 		dev_dbg(er->ur.dev, "write 0x%02x to 0x%02x\n", seq[i], seq[i+1]);
-		eusb2_i2c_write_reg(er, seq[i+1], seq[i]);
+		ret = eusb2_i2c_write_reg(er, seq[i + 1], seq[i]);
+		if (ret)
+			return ret;
 	}
+
+	return 0;
 }
 
 static int eusb2_repeater_power(struct eusb2_repeater *er, bool on)
@@ -249,21 +279,36 @@ static int eusb2_repeater_init(struct usb_repeater *ur, unsigned int flags)
 	struct eusb2_repeater *er =
 			container_of(ur, struct eusb2_repeater, ur);
 	const struct i2c_repeater_chip *chip = er->chip;
-	u8 reg_val;
+	u8 reg_val = 0;
+	u8 rev_reg;
+	int ret;
 
 	switch (chip->repeater_type) {
 	case TI_REPEATER:
-		eusb2_i2c_read_reg(er, REV_ID, &reg_val);
-		/* If the repeater revision is B1 disable auto-resume WA */
-		if (reg_val == 0x03)
-			ur->flags |= UR_AUTO_RESUME_SUPPORTED;
+		rev_reg = REV_ID;
 		break;
 	case NXP_REPEATER:
-		eusb2_i2c_read_reg(er, REVISION_ID, &reg_val);
+		rev_reg = REVISION_ID;
 		break;
 	default:
 		dev_err(er->ur.dev, "Invalid repeater\n");
+		return 0;
 	}
+
+	/*
+	 * Keep returning 0 on failure: the PHY init would otherwise abort and
+	 * the link would not come up at all. Without tuning the repeater runs
+	 * with its power-on defaults, which still works.
+	 */
+	ret = eusb2_repeater_wait_ready(er, rev_reg, &reg_val);
+	if (ret) {
+		dev_err(er->ur.dev, "skip repeater tuning, using defaults\n");
+		return 0;
+	}
+
+	/* If the TI repeater revision is B1 disable auto-resume WA */
+	if (chip->repeater_type == TI_REPEATER && reg_val == 0x03)
+		ur->flags |= UR_AUTO_RESUME_SUPPORTED;
 
 	dev_info(er->ur.dev, "eUSB2 repeater version = 0x%x ur->flags:0x%x\n", reg_val, ur->flags);
 
@@ -271,14 +316,21 @@ static int eusb2_repeater_init(struct usb_repeater *ur, unsigned int flags)
 	if (er->param_override_seq_cnt) {
 		if (flags & PHY_HOST_MODE) {
 			/*it's host, then write host eye params*/
-			eusb2_repeater_update_seq(er, er->param_override_seq_host,
-					er->param_override_seq_cnt_host);
-			dev_info(er->ur.dev, "eUSB2 repeater init host \n");
+			ret = eusb2_repeater_update_seq(er,
+							er->param_override_seq_host,
+							er->param_override_seq_cnt_host);
 		} else {
-			eusb2_repeater_update_seq(er, er->param_override_seq,
-					er->param_override_seq_cnt);
-			dev_info(er->ur.dev, "eUSB2 repeater init device!\n");
+			ret = eusb2_repeater_update_seq(er,
+							er->param_override_seq,
+							er->param_override_seq_cnt);
 		}
+
+		if (ret)
+			dev_err(er->ur.dev, "eUSB2 repeater %s tuning failed: %d\n",
+				(flags & PHY_HOST_MODE) ? "host" : "device", ret);
+		else
+			dev_info(er->ur.dev, "eUSB2 repeater init %s\n",
+				 (flags & PHY_HOST_MODE) ? "host" : "device");
 	}
 
 	return 0;
