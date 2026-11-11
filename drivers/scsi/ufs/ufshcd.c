@@ -4815,6 +4815,13 @@ static void ufshcd_set_queue_depth(struct scsi_device *sdev)
 	else
 		lun_qdepth = min_t(int, lun_qdepth, hba->nutrs);
 
+	/*
+	 * One of the hba->nutrs slots is reserved for device management
+	 * commands, so the host has only can_queue tags for SCSI commands.
+	 * A deeper LU queue would let a request take a budget without a tag.
+	 */
+	lun_qdepth = min_t(int, lun_qdepth, sdev->host->can_queue);
+
 	dev_dbg(hba->dev, "%s: activate tcq with queue depth %d\n",
 			__func__, lun_qdepth);
 	scsi_change_queue_depth(sdev, lun_qdepth);

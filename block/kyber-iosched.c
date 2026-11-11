@@ -177,6 +177,12 @@ struct kyber_queue_data {
 	/* Timer for stats aggregation and adjusting domain tokens. */
 	struct timer_list timer;
 
+	/*
+	 * Protects latency_buckets, latency_timeout and domain_p99, which are
+	 * used by the timer and reset when a latency target is changed.
+	 */
+	spinlock_t lat_lock;
+
 	unsigned int latency_buckets[KYBER_OTHER][2][KYBER_LATENCY_BUCKETS];
 
 	unsigned long latency_timeout[KYBER_OTHER];
@@ -303,6 +309,8 @@ static void kyber_timer_fn(struct timer_list *t)
 	int cpu;
 	bool bad = false;
 
+	spin_lock(&kqd->lat_lock);
+
 	/* Sum all of the per-cpu latency histograms. */
 	for_each_possible_cpu(cpu) {
 		struct kyber_cpu_latency *cpu_latency;
@@ -380,6 +388,15 @@ static void kyber_timer_fn(struct timer_list *t)
 			orig_depth = kqd->domain_tokens[sched_domain].sb.depth;
 			depth = (orig_depth * (p99 + 1)) >> KYBER_LATENCY_SHIFT;
 
+			/*
+			 * At depths below 4 the scaling above rounds down to
+			 * the current depth unless the p99 is far beyond the
+			 * target. Do not let rounding pin a domain that misses
+			 * its target.
+			 */
+			if (p99 >= KYBER_GOOD_BUCKETS)
+				depth = max(depth, orig_depth + 1);
+
 			/* Limit each adjustment to 25% to avoid UFS oscillation. */
 			step = max(1U, orig_depth / 4);
 			lower = orig_depth > step ? orig_depth - step : 1;
@@ -389,6 +406,8 @@ static void kyber_timer_fn(struct timer_list *t)
 					    clamp(depth, lower, upper));
 		}
 	}
+
+	spin_unlock(&kqd->lat_lock);
 }
 
 static unsigned int kyber_sched_tags_shift(struct request_queue *q)
@@ -446,6 +465,7 @@ static struct kyber_queue_data *kyber_queue_data_alloc(struct request_queue *q)
 	if (!kqd->cpu_latency)
 		goto err_kqd;
 
+	spin_lock_init(&kqd->lat_lock);
 	timer_setup(&kqd->timer, kyber_timer_fn, 0);
 
 	for (i = 0; i < KYBER_NUM_DOMAINS; i++) {
@@ -612,6 +632,12 @@ static void rq_clear_domain_token(struct kyber_queue_data *kqd,
 		sched_domain = kyber_sched_domain(rq->cmd_flags);
 		sbitmap_queue_clear(&kqd->domain_tokens[sched_domain], nr,
 				    rq->mq_ctx->cpu);
+		/*
+		 * A requeued request can be issued again from hctx->dispatch
+		 * without passing through kyber_dispatch_request(). Forget the
+		 * token so that it is not cleared a second time on completion.
+		 */
+		rq_set_domain_token(rq, -1);
 	}
 }
 
@@ -980,10 +1006,16 @@ static ssize_t kyber_##name##_lat_store(struct elevator_queue *e,	\
 	if (nsec < KYBER_MIN_LATENCY || nsec > KYBER_MAX_LATENCY)	\
 		return -EINVAL;						\
 									\
-	/* Drop samples bucketed relative to the old target. */		\
-	del_timer_sync(&kqd->timer);					\
+	/*								\
+	 * Samples are bucketed relative to the target. Completions	\
+	 * can re-arm the timer at any time, so stopping it is not	\
+	 * enough: switch the target and drop the old samples under	\
+	 * the lock taken by the timer.					\
+	 */								\
+	spin_lock_bh(&kqd->lat_lock);					\
 	WRITE_ONCE(kqd->latency_targets[domain], nsec);			\
 	kyber_reset_latency(kqd, domain);				\
+	spin_unlock_bh(&kqd->lat_lock);					\
 									\
 	return count;							\
 }
@@ -991,10 +1023,31 @@ KYBER_LAT_SHOW_STORE(KYBER_READ, read);
 KYBER_LAT_SHOW_STORE(KYBER_WRITE, write);
 #undef KYBER_LAT_SHOW_STORE
 
+/*
+ * Current and maximum token depth of each domain. debugfs is not built into
+ * production kernels, so this is the only way to see the throttling state
+ * without tracing.
+ */
+static ssize_t kyber_domain_depth_show(struct elevator_queue *e, char *page)
+{
+	struct kyber_queue_data *kqd = e->elevator_data;
+	ssize_t len = 0;
+	int i;
+
+	for (i = 0; i < KYBER_NUM_DOMAINS; i++)
+		len += sysfs_emit_at(page, len, "%s %u/%u\n",
+				     kyber_domain_names[i],
+				     READ_ONCE(kqd->domain_tokens[i].sb.depth),
+				     kqd->domain_max_depth[i]);
+
+	return len;
+}
+
 #define KYBER_LAT_ATTR(op) __ATTR(op##_lat_nsec, 0644, kyber_##op##_lat_show, kyber_##op##_lat_store)
 static struct elv_fs_entry kyber_sched_attrs[] = {
 	KYBER_LAT_ATTR(read),
 	KYBER_LAT_ATTR(write),
+	__ATTR(domain_depth, 0444, kyber_domain_depth_show, NULL),
 	__ATTR_NULL
 };
 #undef KYBER_LAT_ATTR
