@@ -60,7 +60,11 @@
 
 /* default value of auto suspend is 3 seconds */
 #define UFS_QCOM_AUTO_SUSPEND_DELAY	3000
-#define UFS_QCOM_CLK_GATING_DELAY_MS_PWR_SAVE	10
+/*
+ * Clock gating delay while the clocks are scaled down. I/O that arrives at
+ * shorter intervals does not pay for ungating and a hibern8 exit every time.
+ */
+#define UFS_QCOM_CLK_GATING_DELAY_MS_PWR_SAVE	30
 #define UFS_QCOM_CLK_GATING_DELAY_MS_PERF	50
 
 /* QCOM UFS host controller vendor specific registers */
