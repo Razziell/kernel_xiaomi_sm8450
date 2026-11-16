@@ -29,6 +29,19 @@ struct xiaomi_touch_interface {
 	 */
 	int (*get_mode_value)(void *private, enum touch_mode mode);
 
+	/**
+	 * set_pocket_mode: - Optional. Tells the driver that the phone entered
+	 *                    or left a pocket (nonui mode).
+	 * @private: Private data from the touchscreen driver.
+	 * @in_pocket: True while gestures must not be reported.
+	 *
+	 * Gestures are dropped by xiaomi touch itself while in a pocket, so a
+	 * driver only needs this if it can silence them in the controller
+	 * cheaply, without a reset, to keep it from waking the system up.
+	 * May be called while resumed and may sleep.
+	 */
+	void (*set_pocket_mode)(void *private, bool in_pocket);
+
 	/*
 	 * Private data from the touchscreen driver.
 	 * This typically contains the core data necessary for the callbacks.

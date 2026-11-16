@@ -564,6 +564,13 @@ struct goodix_ts_core {
 
 	struct workqueue_struct *gesture_wq;
 	struct delayed_work gesture_work;
+	/*
+	 * Serializes gesture commands and protects nonui_enabled and
+	 * gesture_mode_active. Taken inside goodix_modules.mutex.
+	 */
+	struct mutex gesture_lock;
+	/* The controller was put into gesture mode by the last suspend. */
+	bool gesture_mode_active;
 
 	bool nonui_enabled;
 	bool high_report_rate;
@@ -704,6 +711,7 @@ struct kobject *goodix_get_default_kobj(void);
 struct goodix_ts_hw_ops *goodix_get_hw_ops(void);
 int goodix_get_config_proc(struct goodix_ts_core *cd);
 int goodix_ts_set_irq_wake(struct goodix_ts_core *cd, bool enable);
+int goodix_ts_send_gesture_mask(struct goodix_ts_core *cd);
 
 int goodix_spi_bus_init(void);
 void goodix_spi_bus_exit(void);

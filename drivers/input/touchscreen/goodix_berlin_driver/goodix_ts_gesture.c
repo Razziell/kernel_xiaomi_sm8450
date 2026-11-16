@@ -242,8 +242,11 @@ static int gsx_gesture_ist(struct goodix_ts_core *cd,
 		"gsx_gesture_ist called, gesture type is %d, nonui enabled is %d",
 		cd->gesture_type, cd->nonui_enabled);
 
-	if (atomic_read(&cd->suspended) == 0 || cd->gesture_type == 0 ||
-	    cd->nonui_enabled)
+	/*
+	 * An event which was already on its way when the gestures were masked
+	 * for the pocket is still read here: xiaomi touch drops it.
+	 */
+	if (atomic_read(&cd->suspended) == 0 || cd->gesture_type == 0)
 		return EVT_CONTINUE;
 
 	ret = hw_ops->event_handler(cd, &gs_event);
@@ -297,8 +300,10 @@ static int gsx_gesture_ist(struct goodix_ts_core *cd,
 	}
 
 re_send_ges_cmd:
-	if (hw_ops->gesture(cd, 0))
+	mutex_lock(&cd->gesture_lock);
+	if (goodix_ts_send_gesture_mask(cd))
 		ts_info("warning: failed re_send gesture cmd");
+	mutex_unlock(&cd->gesture_lock);
 	return EVT_CANCEL_IRQEVT;
 }
 
@@ -319,21 +324,26 @@ static int gsx_gesture_before_suspend(struct goodix_ts_core *cd,
 	if (cd->gesture_type == 0)
 		return EVT_CONTINUE;
 
-	ret = hw_ops->gesture(cd, 0);
+	mutex_lock(&cd->gesture_lock);
+	ret = goodix_ts_send_gesture_mask(cd);
 	if (ret) {
 		ts_err("failed enter gesture mode: %d", ret);
-		return EVT_CONTINUE;
+		goto unlock;
 	}
 
-	ts_info("enter gesture mode, type[0x%02X]", cd->gesture_type);
+	ts_info("enter gesture mode, type[0x%02X]%s", cd->gesture_type,
+		cd->nonui_enabled ? ", masked for pocket" : "");
 	hw_ops->irq_enable(cd, true);
 	ret = goodix_ts_set_irq_wake(cd, true);
 	if (ret) {
 		hw_ops->irq_enable(cd, false);
-		return EVT_CONTINUE;
+		goto unlock;
 	}
+	cd->gesture_mode_active = true;
 
-	return EVT_CANCEL_SUSPEND;
+unlock:
+	mutex_unlock(&cd->gesture_lock);
+	return ret ? EVT_CONTINUE : EVT_CANCEL_SUSPEND;
 }
 
 static int gsx_gesture_before_resume(struct goodix_ts_core *cd,

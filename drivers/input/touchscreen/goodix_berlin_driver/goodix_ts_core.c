@@ -1911,6 +1911,19 @@ out:
 }
 
 /**
+ * goodix_ts_send_gesture_mask - (re)send the gesture command
+ * Sends the gestures which may be reported right now: the enabled ones, or
+ * none while the phone is in a pocket. Caller holds gesture_lock.
+ */
+int goodix_ts_send_gesture_mask(struct goodix_ts_core *cd)
+{
+	lockdep_assert_held(&cd->gesture_lock);
+
+	return cd->hw_ops->gesture(cd,
+			cd->nonui_enabled ? 0 : cd->gesture_type);
+}
+
+/**
  * goodix_ts_suspend - Touchscreen suspend function
  * Called by PM/FB/EARLYSUSPEN module to put the device to  sleep
  */
@@ -2010,6 +2023,11 @@ static int goodix_ts_resume(struct goodix_ts_core *core_data)
 
 	cancel_delayed_work_sync(&core_data->gesture_work);
 
+	/* the controller is reset or powered on below */
+	mutex_lock(&core_data->gesture_lock);
+	core_data->gesture_mode_active = false;
+	mutex_unlock(&core_data->gesture_lock);
+
 	mutex_lock(&goodix_modules.mutex);
 	if (!list_empty(&goodix_modules.head)) {
 		list_for_each_entry_safe(ext_module, next,
@@ -2071,50 +2089,102 @@ static void goodix_resume_work(struct work_struct *work)
 	goodix_ts_resume(core_data);
 }
 
+/**
+ * goodix_ts_rearm_gesture - make a suspended controller report the gestures
+ * which are wanted now. Caller holds gesture_lock and gesture_type is not 0.
+ *
+ * Berlin D firmware takes a new gesture mask while it is in gesture mode.
+ * Any other controller, and one that was put to sleep, is reset first.
+ */
+static int goodix_ts_rearm_gesture(struct goodix_ts_core *core_data)
+{
+	struct goodix_ts_hw_ops *hw_ops = core_data->hw_ops;
+	int res = -EAGAIN;
+
+	if (core_data->gesture_mode_active &&
+	    core_data->bus->ic_type == IC_TYPE_BERLIN_D)
+		res = goodix_ts_send_gesture_mask(core_data);
+
+	if (res) {
+		core_data->gesture_mode_active = false;
+		res = hw_ops->reset(core_data, GOODIX_NORMAL_RESET_DELAY_MS);
+		if (res) {
+			ts_err("reset failed during gesture works");
+			return res;
+		}
+
+		res = goodix_ts_send_gesture_mask(core_data);
+		if (res) {
+			ts_err("failed enter gesture mode");
+			return res;
+		}
+		ts_info("enter gesture mode");
+	}
+
+	core_data->gesture_mode_active = true;
+	if (!atomic_read(&core_data->irq_enabled))
+		hw_ops->irq_enable(core_data, true);
+	goodix_ts_set_irq_wake(core_data, true);
+
+	return 0;
+}
+
 static void goodix_set_gesture_work(struct work_struct *work)
 {
 	struct delayed_work *dwork = to_delayed_work(work);
 	struct goodix_ts_core *core_data =
 		container_of(dwork, struct goodix_ts_core, gesture_work);
 	struct goodix_ts_hw_ops *hw_ops = core_data->hw_ops;
-	unsigned int target_gesture_type;
-	int res;
 
+	mutex_lock(&core_data->gesture_lock);
 	if (!atomic_read(&core_data->suspended)) {
 		ts_debug("touch is not suspended, skip re-wake");
-		return;
+		goto unlock;
 	}
 
 	pm_stay_awake(core_data->bus->dev);
 
-	target_gesture_type =
-		core_data->nonui_enabled ? 0 : core_data->gesture_type;
-
-	if (target_gesture_type == 0) {
+	if (core_data->gesture_type == 0) {
 		hw_ops->irq_enable(core_data, false);
 		goodix_ts_set_irq_wake(core_data, false);
-		hw_ops->gesture(core_data, 0);
-		goto exit;
-	}
-
-	res = hw_ops->reset(core_data, GOODIX_NORMAL_RESET_DELAY_MS);
-	if (res) {
-		ts_err("reset failed during gesture works");
-		goto exit;
-	}
-
-	res = hw_ops->gesture(core_data, target_gesture_type);
-	if (res) {
-		ts_err("failed enter gesture mode");
-		goto exit;
+		if (core_data->gesture_mode_active)
+			goodix_ts_send_gesture_mask(core_data);
 	} else {
-		ts_err("enter gesture mode");
+		goodix_ts_rearm_gesture(core_data);
 	}
-	hw_ops->irq_enable(core_data, true);
-	goodix_ts_set_irq_wake(core_data, true);
 
-exit:
 	pm_relax(core_data->bus->dev);
+unlock:
+	mutex_unlock(&core_data->gesture_lock);
+}
+
+/*
+ * Pocket (nonui) mode: the gestures are switched off in the controller, so
+ * that fabric rubbing on the glass does not wake the system up over and over.
+ * Done at once and without a reset; controllers which cannot do that keep
+ * their gestures and xiaomi touch drops the reports.
+ */
+static void goodix_set_pocket_mode(void *private, bool in_pocket)
+{
+	struct goodix_ts_core *ts_core = private;
+
+	mutex_lock(&ts_core->gesture_lock);
+	if (ts_core->nonui_enabled == in_pocket)
+		goto unlock;
+
+	ts_core->nonui_enabled = in_pocket;
+	if (!ts_core->gesture_mode_active || ts_core->gesture_type == 0 ||
+	    ts_core->bus->ic_type != IC_TYPE_BERLIN_D)
+		goto unlock;
+
+	if (goodix_ts_rearm_gesture(ts_core))
+		ts_err("failed to %s gestures", in_pocket ? "mask" : "unmask");
+	else
+		ts_info("pocket mode %s, gestures %s", in_pocket ? "on" : "off",
+			in_pocket ? "masked" : "unmasked");
+
+unlock:
+	mutex_unlock(&ts_core->gesture_lock);
 }
 
 static int goodix_set_cur_value(void *private, enum touch_mode mode, int value)
@@ -2142,8 +2212,8 @@ static int goodix_set_cur_value(void *private, enum touch_mode mode, int value)
 			ts_core->gesture_type &= ~GESTURE_FOD_PRESS;
 		break;
 	case TOUCH_MODE_NONUI_MODE:
-		ts_core->nonui_enabled = value != 0;
-		break;
+		goodix_set_pocket_mode(ts_core, value != 0);
+		goto exit;
 	case TOUCH_MODE_REPORT_RATE:
 		ts_core->hw_ops->switch_report_rate(ts_core, value);
 		goto exit;
@@ -2541,6 +2611,7 @@ static void xiaomi_touch_init(struct goodix_ts_core *ts_core)
 {
 	ts_core->xiaomi_touch.set_mode_value = goodix_set_cur_value;
 	ts_core->xiaomi_touch.get_mode_value = goodix_get_mode_value;
+	ts_core->xiaomi_touch.set_pocket_mode = goodix_set_pocket_mode;
 	ts_core->xiaomi_touch.private = ts_core;
 	register_xiaomi_touch_client(TOUCH_ID_PRIMARY, &ts_core->xiaomi_touch);
 }
@@ -2662,6 +2733,7 @@ static int goodix_ts_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	}
 	mutex_init(&core_data->irq_wake_lock);
+	mutex_init(&core_data->gesture_lock);
 
 	if (IS_ENABLED(CONFIG_OF) && bus_interface->dev->of_node) {
 		/* parse devicetree property */

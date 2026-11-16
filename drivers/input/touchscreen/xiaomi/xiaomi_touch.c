@@ -14,6 +14,7 @@
 #include <linux/device.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/soc/qcom/panel_event_notifier.h>
 #include <linux/uaccess.h>
@@ -98,6 +99,9 @@ static enum touch_id active_touch_id = TOUCH_ID_PRIMARY;
  * command to enable/disable this mode.
  */
 static atomic_t pocket_disable_gestures = ATOMIC_INIT(0);
+
+/* Keeps the pocket state and the drivers told about it in the same order. */
+static DEFINE_MUTEX(pocket_lock);
 
 struct touch_mode_attribute {
 	struct device_attribute dev_attr;
@@ -302,6 +306,27 @@ static const struct attribute_group oneshot_sensor_group = {
 	.attrs = oneshot_sensor_attrs,
 };
 
+/**
+ * touch_set_pocket_mode: - Store the pocket (nonui) state and pass it on to
+ *                          the drivers which can silence their controller.
+ * @value: Value of TOUCH_MODE_NONUI_MODE, not zero while in a pocket.
+ */
+static void touch_set_pocket_mode(int value)
+{
+	struct xiaomi_touch_interface *interface;
+	int i;
+
+	mutex_lock(&pocket_lock);
+	atomic_set(&pocket_disable_gestures, value);
+	for (i = 0; i < TOUCH_ID_NUM; i++) {
+		interface = interfaces[i];
+		if (interface && interface->set_pocket_mode)
+			interface->set_pocket_mode(interface->private,
+						   value != 0);
+	}
+	mutex_unlock(&pocket_lock);
+}
+
 static int touch_mode_get(enum touch_mode mode)
 {
 	struct xiaomi_touch_interface *interface;
@@ -344,7 +369,7 @@ static int touch_mode_set(enum touch_mode mode, int value)
 		sysfs_notify(&touch_dev->kobj, NULL, "fod_finger_state");
 		return 0;
 	case TOUCH_MODE_NONUI_MODE:
-		atomic_set(&pocket_disable_gestures, value);
+		touch_set_pocket_mode(value);
 		return 0;
 	case TOUCH_MODE_FOLD_STATUS:
 		switch (value) {

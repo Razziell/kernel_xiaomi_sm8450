@@ -355,6 +355,17 @@ int brl_resume(struct goodix_ts_core *cd)
 
 #define GOODIX_GESTURE_CMD_BA	0x12
 #define GOODIX_GESTURE_CMD		0xA6
+/* Berlin D: a set bit keeps the gesture switched off in the firmware */
+#define GOODIX_GESTURE_OFF_DOUBLE_TAP	0x80	/* data[0] */
+#define GOODIX_GESTURE_OFF_SINGLE_TAP	0x10	/* data[1], single tap and FOD */
+/**
+ * brl_gesture - put the controller into gesture mode
+ * @gesture_type: GESTURE_* bits of the gestures the controller may report
+ *
+ * Berlin D firmware reports only the gestures left enabled here and takes a
+ * new mask while it is already in gesture mode. For the other controllers
+ * every gesture stays on and the driver filters the reports.
+ */
 int brl_gesture(struct goodix_ts_core *cd, int gesture_type)
 {
 	struct goodix_ts_cmd cmd;
@@ -365,8 +376,14 @@ int brl_gesture(struct goodix_ts_core *cd, int gesture_type)
 	else
 		cmd.cmd = GOODIX_GESTURE_CMD;
 	cmd.len = 6;
-	cmd.data[0] = (gesture_type >> 0) & 0x01;
-	cmd.data[1] = (gesture_type >> 1) & 0x01;
+	cmd.data[0] = 0;
+	cmd.data[1] = 0;
+	if (cd->bus->ic_type == IC_TYPE_BERLIN_D) {
+		if (!(gesture_type & GESTURE_DOUBLE_TAP))
+			cmd.data[0] |= GOODIX_GESTURE_OFF_DOUBLE_TAP;
+		if (!(gesture_type & (GESTURE_SINGLE_TAP | GESTURE_FOD_PRESS)))
+			cmd.data[1] |= GOODIX_GESTURE_OFF_SINGLE_TAP;
+	}
 
 	ret = cd->hw_ops->send_cmd(cd, &cmd);
 	if (ret)
