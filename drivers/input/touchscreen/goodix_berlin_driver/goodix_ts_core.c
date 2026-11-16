@@ -21,6 +21,7 @@
 #include <linux/uaccess.h>
 #include <linux/gpio/consumer.h>
 #include <linux/soc/qcom/panel_event_notifier.h>
+#include <linux/power_supply.h>
 
 #if LINUX_VERSION_CODE > KERNEL_VERSION(2, 6, 38)
 #include <linux/input/mt.h>
@@ -28,6 +29,8 @@
 #endif
 
 #include "goodix_ts_core.h"
+
+static void goodix_ts_charger_resync(struct goodix_ts_core *cd);
 
 #define GOODIX_DEFAULT_CFG_NAME		"goodix_cfg_group.cfg"
 #define GOOIDX_INPUT_PHYS			"goodix_ts/input0"
@@ -367,8 +370,10 @@ static ssize_t goodix_ts_reset_store(struct device *dev,
 
 	if (!buf || count <= 0)
 		return -EINVAL;
-	if (buf[0] != '0')
+	if (buf[0] != '0') {
 		hw_ops->reset(core_data, GOODIX_NORMAL_RESET_DELAY_MS);
+		goodix_ts_charger_resync(core_data);
+	}
 	return count;
 }
 
@@ -1379,6 +1384,8 @@ static int goodix_ts_request_handle(struct goodix_ts_core *cd,
 	else
 		ts_info("success handle ic request 0x%x",
 			ts_event->request_code);
+	if (ts_event->request_code == REQUEST_TYPE_RESET)
+		goodix_ts_charger_resync(cd);
 	return ret;
 }
 
@@ -1763,6 +1770,7 @@ static void goodix_ts_esd_work(struct work_struct *work)
 		goodix_ts_power_off(cd);
 		usleep_range(5000, 5100);
 		goodix_ts_power_on(cd);
+		goodix_ts_charger_resync(cd);
 	}
 
 exit:
@@ -1909,6 +1917,148 @@ out:
 	mutex_unlock(&cd->irq_wake_lock);
 	return ret;
 }
+
+#if IS_ENABLED(CONFIG_POWER_SUPPLY)
+static bool goodix_ts_psy_has_prop(struct power_supply *psy,
+				   enum power_supply_property prop)
+{
+	size_t i;
+
+	for (i = 0; i < psy->desc->num_properties; i++)
+		if (psy->desc->properties[i] == prop)
+			return true;
+
+	return false;
+}
+
+/*
+ * The rule of power_supply_is_system_supplied(), except that a property is
+ * read only from a supply which has it: some supply drivers log an error
+ * each time they are asked for one they do not have.
+ */
+static int goodix_ts_psy_is_online(struct device *dev, void *data)
+{
+	struct power_supply *psy = dev_get_drvdata(dev);
+	union power_supply_propval val = { 0, };
+
+	if (!psy || !psy->desc || psy->desc->type == POWER_SUPPLY_TYPE_BATTERY)
+		return 0;
+
+	/* a supply which powers something else, e.g. USB in host mode */
+	if (goodix_ts_psy_has_prop(psy, POWER_SUPPLY_PROP_SCOPE) &&
+	    !power_supply_get_property(psy, POWER_SUPPLY_PROP_SCOPE, &val) &&
+	    val.intval == POWER_SUPPLY_SCOPE_DEVICE)
+		return 0;
+
+	if (goodix_ts_psy_has_prop(psy, POWER_SUPPLY_PROP_ONLINE) &&
+	    !power_supply_get_property(psy, POWER_SUPPLY_PROP_ONLINE, &val))
+		return val.intval > 0;
+
+	return 0;
+}
+
+/* Finds out whether a charger is connected. Reading the supplies may block. */
+static void goodix_ts_charger_work(struct work_struct *work)
+{
+	struct goodix_ts_core *cd =
+		container_of(work, struct goodix_ts_core, charger_work);
+
+	/* nothing is sent while suspended, and resume asks again */
+	if (atomic_read(&cd->suspended))
+		return;
+
+	WRITE_ONCE(cd->charger_present,
+		   class_for_each_device(power_supply_class, NULL, NULL,
+					 goodix_ts_psy_is_online) > 0);
+	queue_work(cd->power_wq, &cd->charger_apply_work);
+}
+
+/* Runs on the power workqueue: never together with suspend or resume. */
+static void goodix_ts_charger_apply_work(struct work_struct *work)
+{
+	struct goodix_ts_core *cd =
+		container_of(work, struct goodix_ts_core, charger_apply_work);
+	int on = READ_ONCE(cd->charger_present);
+
+	if (atomic_read(&cd->suspended) ||
+	    atomic_read(&cd->charger_mode) == on)
+		return;
+
+	/* stored first: a reset during the command has to win */
+	atomic_set(&cd->charger_mode, on);
+	if (cd->hw_ops->charger_on(cd, on)) {
+		atomic_set(&cd->charger_mode, -1);
+		ts_err("failed to switch charger mode %s", on ? "on" : "off");
+		return;
+	}
+	ts_info("charger mode %s", on ? "on" : "off");
+}
+
+static int goodix_ts_charger_notifier_call(struct notifier_block *nb,
+					   unsigned long event, void *data)
+{
+	struct goodix_ts_core *cd =
+		container_of(nb, struct goodix_ts_core, charger_notifier);
+
+	if (event == PSY_EVENT_PROP_CHANGED && !atomic_read(&cd->suspended))
+		schedule_work(&cd->charger_work);
+
+	return NOTIFY_DONE;
+}
+
+/**
+ * goodix_ts_charger_resync - the controller was reset in normal mode
+ * A reset switches the charger mode off. Look at the supplies again and
+ * switch it back on if a charger is connected.
+ */
+static void goodix_ts_charger_resync(struct goodix_ts_core *cd)
+{
+	if (!cd->charger_registered)
+		return;
+
+	atomic_set(&cd->charger_mode, 0);
+	schedule_work(&cd->charger_work);
+}
+
+/**
+ * goodix_ts_charger_init - follow the charger with the noise mode
+ * Berlin D firmware filters the noise a charger puts on the panel when it is
+ * told that one is connected. Other controllers are left alone.
+ */
+static void goodix_ts_charger_init(struct goodix_ts_core *cd)
+{
+	if (cd->bus->ic_type != IC_TYPE_BERLIN_D || !cd->hw_ops->charger_on)
+		return;
+
+	INIT_WORK(&cd->charger_work, goodix_ts_charger_work);
+	INIT_WORK(&cd->charger_apply_work, goodix_ts_charger_apply_work);
+	atomic_set(&cd->charger_mode, 0);
+	cd->charger_notifier.notifier_call = goodix_ts_charger_notifier_call;
+	if (power_supply_reg_notifier(&cd->charger_notifier)) {
+		ts_err("failed to register power supply notifier");
+		return;
+	}
+	cd->charger_registered = true;
+	schedule_work(&cd->charger_work);
+}
+
+static void goodix_ts_charger_exit(struct goodix_ts_core *cd)
+{
+	if (!cd->charger_registered)
+		return;
+
+	power_supply_unreg_notifier(&cd->charger_notifier);
+	/* a resume still on its way would schedule the work again */
+	flush_workqueue(cd->power_wq);
+	cd->charger_registered = false;
+	cancel_work_sync(&cd->charger_work);
+	cancel_work_sync(&cd->charger_apply_work);
+}
+#else
+static void goodix_ts_charger_resync(struct goodix_ts_core *cd) {}
+static void goodix_ts_charger_init(struct goodix_ts_core *cd) {}
+static void goodix_ts_charger_exit(struct goodix_ts_core *cd) {}
+#endif
 
 /**
  * goodix_ts_send_gesture_mask - (re)send the gesture command
@@ -2078,6 +2228,7 @@ out:
 	if (core_data->high_report_rate) {
 		core_data->hw_ops->switch_report_rate(core_data, true);
 	}
+	goodix_ts_charger_resync(core_data);
 	ts_info("Resume end");
 	return 0;
 }
@@ -2375,6 +2526,7 @@ static int goodix_generic_noti_callback(struct notifier_block *self,
 		if (hw_ops->read_version(cd, &cd->fw_version))
 			ts_info("failed read fw version info[ignore]");
 		hw_ops->irq_enable(cd, 1);
+		goodix_ts_charger_resync(cd);
 		break;
 	default:
 		break;
@@ -2562,6 +2714,8 @@ upgrade:
 	if (cd->board_data.support_thp_fw) {
 		cd->hw_ops->set_coor_mode(cd);
 	}
+
+	goodix_ts_charger_init(cd);
 
 	return 0;
 
@@ -2846,6 +3000,8 @@ static int goodix_ts_remove(struct platform_device *pdev)
 		goodix_ts_pen_dev_remove(core_data);
 		goodix_ts_sysfs_exit(core_data);
 		goodix_ts_procfs_exit(core_data);
+		/* everything that could ask for a resync is stopped by now */
+		goodix_ts_charger_exit(core_data);
 	}
 
 	/* Power is enabled during stage 1, before the asynchronous init. */

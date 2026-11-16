@@ -467,6 +467,7 @@ struct goodix_ts_hw_ops {
 			struct ts_rawdata_info *info);
 	int (*set_coor_mode)(struct goodix_ts_core *cd);
 	int (*switch_report_rate)(struct goodix_ts_core *cd, bool high);
+	int (*charger_on)(struct goodix_ts_core *cd, bool on);
 };
 
 /*
@@ -574,6 +575,15 @@ struct goodix_ts_core {
 
 	bool nonui_enabled;
 	bool high_report_rate;
+
+	/* charger noise mode, see goodix_ts_charger_init() */
+	struct notifier_block charger_notifier;
+	struct work_struct charger_work;
+	struct work_struct charger_apply_work;
+	bool charger_registered;
+	bool charger_present;
+	/* mode the controller is in: 0, 1, or -1 if a command failed */
+	atomic_t charger_mode;
 };
 
 /* external module structures */

@@ -317,6 +317,22 @@ exit:
 	return ret;
 }
 
+#define GOODIX_CHARGER_CMD 0xAF
+/*
+ * Charger noise mode of the Berlin D firmware. Only meant for normal mode;
+ * the controller forgets it on every reset.
+ */
+static int brl_charger_on(struct goodix_ts_core *cd, bool on)
+{
+	struct goodix_ts_cmd cmd;
+
+	cmd.cmd = GOODIX_CHARGER_CMD;
+	cmd.len = 5;
+	cmd.data[0] = on ? 1 : 0;
+
+	return cd->hw_ops->send_cmd(cd, &cmd);
+}
+
 #define GOODIX_HIGH_RATE_CMD 0xC0
 static int brl_switch_report_rate(struct goodix_ts_core *cd, bool high)
 {
@@ -1587,6 +1603,7 @@ static struct goodix_ts_hw_ops brl_hw_ops = {
 	.get_capacitance_data = brl_get_capacitance_data,
 	.set_coor_mode = brl_set_coor_mode,
 	.switch_report_rate = brl_switch_report_rate,
+	.charger_on = brl_charger_on,
 };
 
 struct goodix_ts_hw_ops *goodix_get_hw_ops(void)
