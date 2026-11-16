@@ -58,6 +58,8 @@
 
 #define GOODIX_NORMAL_RESET_DELAY_MS	100
 #define GOODIX_NORMAL_GESTURE_DELAY_MS 300
+/* how long an interrupt waits for the system to come out of suspend */
+#define GOODIX_PM_RESUME_TIMEOUT_MS	300
 #define GOODIX_HOLD_CPU_RESET_DELAY_MS  5
 
 #define GOODIX_RETRY_3					3
@@ -575,6 +577,13 @@ struct goodix_ts_core {
 
 	bool nonui_enabled;
 	bool high_report_rate;
+
+	/*
+	 * System sleep: set from the late suspend to the early resume of this
+	 * device, while the bus cannot be used. See goodix_ts_threadirq_func().
+	 */
+	bool pm_suspended;
+	struct completion pm_resume_done;
 
 	/* charger noise mode, see goodix_ts_charger_init() */
 	struct notifier_block charger_notifier;

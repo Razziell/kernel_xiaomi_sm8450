@@ -443,7 +443,7 @@ static int goodix_ts_convert_0x_data(const u8 *buf, int buf_size,
 			m_size++;
 	}
 
-	if (m_size <= 1) {
+	if (m_size <= 1 || m_size > GOODIX_CFG_MAX_SIZE) {
 		ts_err("cfg file ERROR, valid data count:%d", m_size);
 		return -EINVAL;
 	}
@@ -456,6 +456,10 @@ static int goodix_ts_convert_0x_data(const u8 *buf, int buf_size,
 		if (temp_index >= m_size) {
 			ts_err("exchange cfg data error, overflow, temp_index:%d,m_size:%d",
 					temp_index, m_size);
+			return -EINVAL;
+		}
+		if (i + 2 >= buf_size) {
+			ts_err("cfg file ERROR, truncated at %d", i);
 			return -EINVAL;
 		}
 		high = ascii2hex(buf[i + 1]);
@@ -607,12 +611,17 @@ static ssize_t goodix_ts_reg_rw_store(struct device *dev,
 			ts_err("failed get length info");
 			goto err_out;
 		}
-		rw_len = (u32)result;
-		ts_info("rw length info is %d", rw_len);
-		if (rw_len > sizeof(store_buf)) {
-			ts_err("data len > %lu", sizeof(store_buf));
+		/*
+		 * Checked before it is stored: the show function reads this
+		 * many bytes into show_buf, also after a rejected write.
+		 */
+		if (result <= 0 || result > sizeof(store_buf)) {
+			ts_err("data len must be 1..%lu", sizeof(store_buf));
+			rw_len = 0;
 			goto err_out;
 		}
+		rw_len = (u32)result;
+		ts_info("rw length info is %d", rw_len);
 	}
 
 	if (rw_flag == 1)
@@ -1404,10 +1413,28 @@ static irqreturn_t goodix_ts_threadirq_func(int irq, void *data)
 	struct goodix_ext_module *ext_module, *next;
 	struct goodix_ts_event *ts_event = &core_data->ts_event;
 	struct goodix_ts_esd *ts_esd = &core_data->ts_esd;
+	bool pm_wait = READ_ONCE(core_data->pm_suspended);
 	int ret;
 
 	ts_esd->irq_status = true;
 	core_data->irq_trig_cnt++;
+
+	if (pm_wait) {
+		/*
+		 * The interrupt woke the system up, or came while it was going
+		 * to sleep. The bus refuses transfers until the system has
+		 * resumed far enough, so reading now fails and the event is
+		 * left to the controller signalling it once more. Keep the
+		 * system awake instead and wait for the bus.
+		 */
+		pm_stay_awake(&core_data->pdev->dev);
+		if (!wait_for_completion_timeout(&core_data->pm_resume_done,
+				msecs_to_jiffies(GOODIX_PM_RESUME_TIMEOUT_MS))) {
+			ts_err("system did not resume in time, event dropped");
+			goto out;
+		}
+	}
+
 	/* inform external module */
 	mutex_lock(&goodix_modules.mutex);
 	list_for_each_entry_safe(ext_module, next,
@@ -1417,7 +1444,7 @@ static irqreturn_t goodix_ts_threadirq_func(int irq, void *data)
 		ret = ext_module->funcs->irq_event(core_data, ext_module);
 		if (ret == EVT_CANCEL_IRQEVT) {
 			mutex_unlock(&goodix_modules.mutex);
-			return IRQ_HANDLED;
+			goto out;
 		}
 	}
 	mutex_unlock(&goodix_modules.mutex);
@@ -1440,6 +1467,9 @@ static irqreturn_t goodix_ts_threadirq_func(int irq, void *data)
 			goodix_ts_request_handle(core_data, ts_event);
 	}
 
+out:
+	if (pm_wait)
+		pm_relax(&core_data->pdev->dev);
 	return IRQ_HANDLED;
 }
 
@@ -2475,6 +2505,37 @@ int goodix_ts_fb_notifier_callback(struct notifier_block *self,
 #endif
 
 
+#if defined(CONFIG_PM)
+/*
+ * The late and early phases are the ones around which the bus controller's
+ * runtime PM is switched off by the PM core. This device is registered after
+ * the bus controller, so it suspends before it and resumes after it.
+ */
+static int goodix_ts_pm_suspend_late(struct device *dev)
+{
+	struct goodix_ts_core *core_data = dev_get_drvdata(dev);
+
+	if (!core_data)
+		return 0;
+
+	reinit_completion(&core_data->pm_resume_done);
+	WRITE_ONCE(core_data->pm_suspended, true);
+	return 0;
+}
+
+static int goodix_ts_pm_resume_early(struct device *dev)
+{
+	struct goodix_ts_core *core_data = dev_get_drvdata(dev);
+
+	if (!core_data)
+		return 0;
+
+	WRITE_ONCE(core_data->pm_suspended, false);
+	complete_all(&core_data->pm_resume_done);
+	return 0;
+}
+#endif
+
 #if defined(CONFIG_PM) && !defined(CONFIG_DRM)
 #if !defined(CONFIG_FB) && !defined(CONFIG_HAS_EARLYSUSPEND)
 /**
@@ -2640,6 +2701,20 @@ static int goodix_send_ic_config(struct goodix_ts_core *cd, int type)
 	return cd->hw_ops->send_config(cd, cfg->data, cfg->len);
 }
 
+static void xiaomi_touch_init(struct goodix_ts_core *ts_core)
+{
+	ts_core->xiaomi_touch.set_mode_value = goodix_set_cur_value;
+	ts_core->xiaomi_touch.get_mode_value = goodix_get_mode_value;
+	ts_core->xiaomi_touch.set_pocket_mode = goodix_set_pocket_mode;
+	ts_core->xiaomi_touch.private = ts_core;
+	register_xiaomi_touch_client(TOUCH_ID_PRIMARY, &ts_core->xiaomi_touch);
+}
+
+static void xiaomi_touch_deinit(struct goodix_ts_core *ts_core)
+{
+	unregister_xiaomi_touch_client(TOUCH_ID_PRIMARY);
+}
+
 /**
  * goodix_later_init_thread - init IC fw and config
  * @data: point to goodix_ts_core
@@ -2717,6 +2792,17 @@ upgrade:
 
 	goodix_ts_charger_init(cd);
 
+	/* lets the interrupt thread hold off a suspend, see there */
+	device_init_wakeup(&cd->pdev->dev, true);
+
+	/*
+	 * Only now can mode changes be served: the gesture work and its
+	 * workqueue exist and the command address is known. Registered any
+	 * earlier, or with a failed init, the first gesture change would queue
+	 * a work that was never initialized.
+	 */
+	xiaomi_touch_init(cd);
+
 	return 0;
 
 uninit_fw:
@@ -2759,20 +2845,6 @@ static int goodix_start_later_init(struct goodix_ts_core *ts_core)
 	}
 	ts_core->init_thread_started = true;
 	return 0;
-}
-
-static void xiaomi_touch_init(struct goodix_ts_core *ts_core)
-{
-	ts_core->xiaomi_touch.set_mode_value = goodix_set_cur_value;
-	ts_core->xiaomi_touch.get_mode_value = goodix_get_mode_value;
-	ts_core->xiaomi_touch.set_pocket_mode = goodix_set_pocket_mode;
-	ts_core->xiaomi_touch.private = ts_core;
-	register_xiaomi_touch_client(TOUCH_ID_PRIMARY, &ts_core->xiaomi_touch);
-}
-
-static void xiaomi_touch_deinit(struct goodix_ts_core *ts_core)
-{
-	unregister_xiaomi_touch_client(TOUCH_ID_PRIMARY);
 }
 
 #if defined(CONFIG_DRM)
@@ -2888,6 +2960,7 @@ static int goodix_ts_probe(struct platform_device *pdev)
 	}
 	mutex_init(&core_data->irq_wake_lock);
 	mutex_init(&core_data->gesture_lock);
+	init_completion(&core_data->pm_resume_done);
 
 	if (IS_ENABLED(CONFIG_OF) && bus_interface->dev->of_node) {
 		/* parse devicetree property */
@@ -2950,8 +3023,6 @@ static int goodix_ts_probe(struct platform_device *pdev)
 	/* Try start a thread to get config-bin info */
 	goodix_start_later_init(core_data);
 
-	xiaomi_touch_init(core_data);
-
 	ts_info("goodix_ts_core probe success");
 	return 0;
 
@@ -3002,6 +3073,7 @@ static int goodix_ts_remove(struct platform_device *pdev)
 		goodix_ts_procfs_exit(core_data);
 		/* everything that could ask for a resync is stopped by now */
 		goodix_ts_charger_exit(core_data);
+		device_init_wakeup(&pdev->dev, false);
 	}
 
 	/* Power is enabled during stage 1, before the asynchronous init. */
@@ -3010,12 +3082,15 @@ static int goodix_ts_remove(struct platform_device *pdev)
 	return 0;
 }
 
-#if defined(CONFIG_PM) && !defined(CONFIG_DRM)
+#if defined(CONFIG_PM)
 static const struct dev_pm_ops dev_pm_ops = {
-#if !defined(CONFIG_FB) && !defined(CONFIG_HAS_EARLYSUSPEND)
+#if !defined(CONFIG_DRM) && !defined(CONFIG_FB) && \
+	!defined(CONFIG_HAS_EARLYSUSPEND)
 	.suspend = goodix_ts_pm_suspend,
 	.resume = goodix_ts_pm_resume,
 #endif
+	.suspend_late = goodix_ts_pm_suspend_late,
+	.resume_early = goodix_ts_pm_resume_early,
 };
 #endif
 
@@ -3029,7 +3104,7 @@ static struct platform_driver goodix_ts_driver = {
 	.driver = {
 		.name = GOODIX_CORE_DRIVER_NAME,
 		.owner = THIS_MODULE,
-#if defined(CONFIG_PM) && !defined(CONFIG_DRM)
+#if defined(CONFIG_PM)
 		.pm = &dev_pm_ops,
 #endif
 	},

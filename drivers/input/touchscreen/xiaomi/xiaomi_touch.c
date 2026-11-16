@@ -113,7 +113,19 @@ int register_xiaomi_touch_client(enum touch_id touch_id,
 {
 	if (touch_id >= TOUCH_ID_NUM || interfaces[touch_id])
 		return -EINVAL;
+
+	/*
+	 * A client may register long after boot, when its touchscreen is
+	 * ready. Tell it the pocket state it missed. The gestures follow on
+	 * the next suspend, as their state was not marked as applied.
+	 */
+	mutex_lock(&pocket_lock);
 	interfaces[touch_id] = interface;
+	if (interface->set_pocket_mode)
+		interface->set_pocket_mode(
+			interface->private,
+			atomic_read(&pocket_disable_gestures) != 0);
+	mutex_unlock(&pocket_lock);
 
 	return 0;
 }
@@ -123,7 +135,11 @@ int unregister_xiaomi_touch_client(enum touch_id touch_id)
 {
 	if (touch_id >= TOUCH_ID_NUM)
 		return -EINVAL;
+
+	/* no set_pocket_mode() call is in progress once this returns */
+	mutex_lock(&pocket_lock);
 	interfaces[touch_id] = NULL;
+	mutex_unlock(&pocket_lock);
 
 	return 0;
 }
