@@ -464,6 +464,16 @@ static int brl_write(struct goodix_ts_core *cd, unsigned int addr,
 #define CMD_ACK_OK               0x80
 
 #define GOODIX_CMD_RETRY 6
+
+static bool brl_is_gesture_mask_update(struct goodix_ts_core *cd, u8 cmd)
+{
+	if (cmd != GOODIX_GESTURE_CMD || cd->bus->ic_type != IC_TYPE_BERLIN_D)
+		return false;
+
+	lockdep_assert_held(&cd->gesture_lock);
+	return cd->gesture_mode_active;
+}
+
 static int brl_send_cmd(struct goodix_ts_core *cd,
 	struct goodix_ts_cmd *cmd)
 {
@@ -497,7 +507,11 @@ static int brl_send_cmd(struct goodix_ts_core *cd,
 			ts_debug("cmd ack data %*ph",
 				 (int)sizeof(cmd_ack), cmd_ack.buf);
 			if (cmd_ack.ack == CMD_ACK_OK) {
-				msleep(40); // wait for cmd response
+				/* Only shorten the delay for an in-place mask update. */
+				if (brl_is_gesture_mask_update(cd, cmd->cmd))
+					usleep_range(2000, 2100);
+				else
+					msleep(40);
 				return 0;
 			}
 			if (cmd_ack.ack == CMD_ACK_BUSY ||
@@ -1216,8 +1230,6 @@ static int goodix_touch_handler(struct goodix_ts_core *cd,
 	static u8 pre_finger_num;
 	static u8 pre_pen_num;
 
-	/* clean event buffer */
-	memset(ts_event, 0, sizeof(*ts_event));
 	/* copy pre-data to buffer */
 	memcpy(buffer, pre_buf, pre_buf_len);
 
@@ -1331,6 +1343,8 @@ static int brl_event_handler(struct goodix_ts_core *cd,
 		return -EINVAL;
 	}
 
+	/* An unrecognised status must not replay the previous event. */
+	memset(ts_event, 0, sizeof(*ts_event));
 	event_status = pre_buf[0];
 	if (event_status & GOODIX_TOUCH_EVENT)
 		return goodix_touch_handler(cd, ts_event,
